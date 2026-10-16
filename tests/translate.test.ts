@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
 import { upsertMaterial } from "@aihot/backend/content/materials";
-import { translatePending } from "@aihot/backend/editorial/translate";
+import { translateArticle, translatePending } from "@aihot/backend/editorial/translate";
 import { stopBoss } from "@aihot/backend/jobs/queue";
 import { publishArticle } from "@aihot/backend/publication/publish";
 import { buildApp } from "../apps/api/src/app.ts";
@@ -19,11 +19,18 @@ const URL_ = `https://example.com/translate-${T}`;
 let hold: ReturnType<typeof gate<void>> | null = null;
 const asked = gate();
 const asks = new Map<string, number>();
+// Return a schema-valid response with the wrong segment count for selected inputs.
+const misalignedAnswers = new Map<string, number>();
 const provider = await stub(async (_hit, req) => {
   const { segments } = JSON.parse(JSON.parse(req.body).messages[1].content) as { segments: string[] };
   if (hold) {
     asked.open();
     await hold.promise;
+  }
+  const bad = [...misalignedAnswers.entries()].find(([marker, remaining]) => remaining > 0 && segments.some((s) => s.includes(marker)));
+  if (bad) {
+    misalignedAnswers.set(bad[0], bad[1] - 1);
+    return { id: "stub-bad-alignment", choices: [{ message: { content: '{"t":[]}' } }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } };
   }
   const t = segments.map((s) => {
     // A block with a link and an image: the first answer drops the link, the second keeps everything.
@@ -89,6 +96,12 @@ test("a text corrected while its translation was running is translated again, an
   assert.equal(stale.body.zh, null, "a translation of the old wording is not shown");
   assert.ok(stale.body.original?.includes("twenty"));
 
+  // The corrected material waits for its own analysis and identity decision before another paid
+  // translation. Install that completed current-revision fixture, as the processing chain does.
+  assert.equal((await sql`SELECT selected FROM publications WHERE article_id=${id}`)[0]!.selected, false);
+  await sql`UPDATE analyses SET input_revision=2 WHERE article_id=${id}`;
+  await sql`UPDATE articles SET processing_state='analyzed',grouping_status='complete',grouped_at=now() WHERE id=${id}`;
+  await publishArticle(id);
   await translatePending({ limit: 1 });
   const [tr] = await sql<{ revision: number }[]>`SELECT revision FROM translations WHERE article_id = ${id}`;
   assert.equal(tr?.revision, 2, "the corrected text is translated on the next run");
@@ -113,6 +126,43 @@ test("links and images inside a paragraph survive the translation, or the paragr
   assert.ok(tr!.body_html.includes(`chart-${T}.png`), "the chart stays");
   assert.ok(tr!.body_html.includes('<a href="https://example.com/kept">never keeps</a>'), "a paragraph that loses its link stays in the original");
   assert.equal(tr!.complete, false);
+  const receipts = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject LIKE ${`article:${id}@1#%`}`;
+  assert.ok(receipts.length >= 2, "the initial batch and fallback/retry batches are retained");
+  assert.ok(receipts.every((receipt) => receipt.status === "completed"), "every paid batch covered by the committed translation is completed");
+});
+
+test("translation storage and receipt completion commit together, then reuse the saved answer", async () => {
+  const { articleId: id } = await upsertMaterial({
+    sourceId: SOURCE, url: `${URL_}-receipt`, title: `Receipt ${T}`, language: "en",
+    bodyText: `Receipt lifecycle ${T}.`, bodyHtml: `<p>Receipt lifecycle ${T}.</p>`,
+    bodyStatus: "ok", via: "fetch", publishedAt: new Date(), discoveredAt: new Date(Date.now() + 1_500_000),
+  });
+  await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
+            VALUES (${id}, 1, 'rule', 'pass', 'ai-models', ${`回执-${T}`}, '摘要', '理由', 90, true)`;
+  await publishArticle(id, { releasedAt: new Date(Date.now() - 60_000) });
+
+  await sql.unsafe(`CREATE FUNCTION fail_translation_receipt() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
+    IF NEW.status = 'completed' AND NEW.purpose = 'translate_body' THEN RAISE EXCEPTION 'receipt commit interrupted'; END IF;
+    RETURN NEW; END $body$`);
+  await sql`CREATE TRIGGER fail_translation_receipt BEFORE UPDATE ON receipts FOR EACH ROW EXECUTE FUNCTION fail_translation_receipt()`;
+  const before = provider.hits();
+  try {
+    await assert.rejects(translateArticle(id), /receipt commit interrupted/);
+  } finally {
+    await sql`DROP TRIGGER fail_translation_receipt ON receipts`;
+    await sql`DROP FUNCTION fail_translation_receipt()`;
+  }
+  assert.equal(provider.hits(), before + 1);
+  assert.equal((await sql`SELECT 1 FROM translations WHERE article_id = ${id}`).length, 0, "translation write rolls back with receipt completion");
+  const [received] = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject = ${`article:${id}@1#0`}`;
+  assert.equal(received!.status, "received");
+
+  const retried = await translateArticle(id);
+  assert.equal(retried.status, "translated");
+  assert.equal(provider.hits(), before + 1, "retry reuses the already received provider answer");
+  const [completed] = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject = ${`article:${id}@1#0`}`;
+  assert.equal(completed!.status, "completed");
+  assert.equal((await sql`SELECT 1 FROM translations WHERE article_id = ${id}`).length, 1);
 });
 
 test("the post a selected X post quotes is translated once and shown with the item", async () => {
@@ -133,6 +183,115 @@ test("the post a selected X post quotes is translated once and shown with the it
   const item = JSON.parse(res.body) as { x: { quoted: { text: string; translation: string | null } } };
   assert.deepEqual([item.x.quoted.text, item.x.quoted.translation], [`Introducing Claude Sonnet 5.5 ${T}`, "隆重推出 Sonnet 5.5。"]);
   await translatePending({ limit: 1 });
-  const receipts = await sql`SELECT 1 FROM receipts WHERE purpose = 'translate_quoted' AND subject = ${`quote:${tweetId}`}`;
+  const receipts = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_quoted' AND subject = ${`quote:${tweetId}`}`;
   assert.equal(receipts.length, 1, "translated once");
+  assert.equal(receipts[0]!.status, "completed");
+});
+
+
+test("an unusable X translation gets a bounded fresh attempt instead of terminal skipped", async () => {
+  const marker = `alignment-x-${T}`;
+  const text = `A new model release with practical improvements and detailed availability notes ${marker}. This post explains the new behavior and user-visible changes.`;
+  const { articleId: id } = await upsertMaterial({
+    sourceId: SOURCE, url: `https://x.com/example/status/9${Date.now()}`, title: `Alignment X ${T}`, language: "en",
+    bodyText: text, bodyStatus: "ok", via: "fetch", publishedAt: new Date(), discoveredAt: new Date(Date.now() + 3_600_000),
+    xPost: { tweetId: `9${Date.now()}`, authorName: "Test", handle: "example", text },
+  });
+  await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
+            VALUES (${id}, 1, 'rule', 'pass', 'ai-models', ${`校验-X-${T}`}, '摘要', '理由', 90, true)`;
+  await publishArticle(id, { releasedAt: new Date(Date.now() - 60_000) });
+  misalignedAnswers.set(marker, 1);
+  const before = provider.hits();
+  const first = await translatePending({ limit: 1 });
+  assert.equal(first.done.find((r) => r.articleId === id)?.status, "failed");
+  const [failed] = await sql<{ attempts: number; outcome: string; reason: string }[]>`SELECT attempts, outcome, reason FROM translation_attempts WHERE article_id = ${id}`;
+  assert.deepEqual({ ...failed }, { attempts: 1, outcome: "failed", reason: "translation did not line up" });
+  assert.equal(provider.hits() - before, 1, "the failed model answer was saved once");
+
+  const second = await translatePending({ limit: 1 });
+  assert.equal(second.done.find((r) => r.articleId === id)?.status, "translated");
+  assert.equal(provider.hits() - before, 2, "the second attempt paid for a new answer");
+  const [attempt] = await sql<{ attempts: number; outcome: string }[]>`SELECT attempts, outcome FROM translation_attempts WHERE article_id = ${id}`;
+  assert.deepEqual({ ...attempt }, { attempts: 2, outcome: "translated" });
+  const receipts = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject LIKE ${`article:${id}@1#%`} ORDER BY id`;
+  assert.deepEqual(receipts.map((r) => r.status), ["received", "completed"], "a failed business result cannot complete the first receipt");
+  assert.equal((await detail(id)).body.complete, true);
+});
+
+test("fully unusable body translations stop after three recorded attempts", async () => {
+  const marker = `alignment-body-${T}`;
+  const text = `One complete English paragraph ${marker} that requires a Chinese translation.`;
+  const { articleId: id } = await upsertMaterial({
+    sourceId: SOURCE, url: `${URL_}-alignment`, title: `Alignment body ${T}`, language: "en",
+    bodyText: text, bodyHtml: `<p>${text}</p>`, bodyStatus: "ok", via: "fetch",
+    publishedAt: new Date(), discoveredAt: new Date(Date.now() + 7_200_000),
+  });
+  await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
+            VALUES (${id}, 1, 'rule', 'pass', 'ai-models', ${`校验正文-${T}`}, '摘要', '理由', 90, true)`;
+  await publishArticle(id, { releasedAt: new Date(Date.now() - 60_000) });
+  misalignedAnswers.set(marker, 10);
+  const before = provider.hits();
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const run = await translatePending({ limit: 1 });
+    assert.equal(run.done.find((r) => r.articleId === id)?.status, "failed");
+    const [saved] = await sql<{ attempts: number; outcome: string }[]>`SELECT attempts, outcome FROM translation_attempts WHERE article_id = ${id}`;
+    assert.deepEqual({ ...saved }, { attempts: attempt, outcome: "failed" });
+  }
+  assert.equal(provider.hits() - before, 6, "one initial batch and one fallback per bounded attempt");
+  const exhausted = await translatePending({ limit: 1 });
+  assert.equal(exhausted.done.some((r) => r.articleId === id), false, "the fourth automatic attempt is blocked");
+  assert.equal(provider.hits() - before, 6);
+  assert.equal((await sql`SELECT 1 FROM translations WHERE article_id = ${id}`).length, 0, "no invalid translation is published");
+});
+
+test("a received alignment retry survives a failed translation commit without paying again", async () => {
+  const marker = `alignment-recovery-${T}`;
+  const post = `This detailed English announcement ${marker} describes a new public release and its availability. The main changes are supported by documented examples and clear usage notes.`;
+  const tweetId = `9${Date.now()}`;
+  const { articleId: id } = await upsertMaterial({
+    sourceId: SOURCE, url: `https://x.com/example/status/${tweetId}`, title: `Recovery ${T}`, language: "en",
+    bodyText: post, bodyStatus: "ok", via: "fetch", publishedAt: new Date(), discoveredAt: new Date(Date.now() + 10_800_000),
+    xPost: { tweetId, authorName: "Test", handle: "example", text: post },
+  });
+  await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
+            VALUES (${id}, 1, 'rule', 'pass', 'ai-models', ${`恢复测试-${T}`}, '摘要', '理由', 90, true)`;
+  await publishArticle(id, { releasedAt: new Date(Date.now() - 60_000) });
+  misalignedAnswers.set(marker, 1);
+  const before = provider.hits();
+  const first = await translatePending({ limit: 1 });
+  assert.equal(first.done.find((r) => r.articleId === id)?.status, "failed");
+  const [one] = await sql<{ attempts: number; outcome: string; request_tag: string | null }[]>`
+    SELECT attempts, outcome, request_tag FROM translation_attempts WHERE article_id = ${id}`;
+  assert.deepEqual({ ...one }, { attempts: 1, outcome: "failed", request_tag: null });
+
+  await sql.unsafe(`CREATE FUNCTION fail_translation_receipt() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
+    IF NEW.status = 'completed' AND NEW.purpose = 'translate_body' THEN RAISE EXCEPTION 'receipt commit interrupted'; END IF;
+    RETURN NEW; END $body$`);
+  await sql`CREATE TRIGGER fail_translation_receipt BEFORE UPDATE ON receipts FOR EACH ROW EXECUTE FUNCTION fail_translation_receipt()`;
+  try {
+    const second = await translatePending({ limit: 1 });
+    assert.equal(second.done.some((r) => r.articleId === id), true, "the paid response arrived before the storage failure");
+    const [failed] = await sql<{ attempts: number; outcome: string; reason: string; request_tag: string | null }[]>`
+      SELECT attempts, outcome, reason, request_tag FROM translation_attempts WHERE article_id = ${id}`;
+    assert.equal(failed!.attempts, 2);
+    assert.equal(failed!.outcome, "failed");
+    assert.match(failed!.reason, /receipt commit interrupted/);
+    assert.equal(failed!.request_tag, "alignment-retry-1", "the used request identity survives a changed failure reason");
+    const [answer] = await sql<{ status: string }[]>`
+      SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject = ${`article:${id}@1#0`} ORDER BY id DESC LIMIT 1`;
+    assert.equal(answer!.status, "received", "the valid paid answer is saved even though the business write rolled back");
+    assert.equal(provider.hits() - before, 2);
+    assert.equal((await sql`SELECT 1 FROM translations WHERE article_id = ${id}`).length, 0);
+  } finally {
+    await sql`DROP TRIGGER fail_translation_receipt ON receipts`;
+    await sql`DROP FUNCTION fail_translation_receipt()`;
+  }
+
+  const recovered = await translatePending({ limit: 1 });
+  assert.equal(recovered.done.find((r) => r.articleId === id)?.status, "translated");
+  assert.equal(provider.hits() - before, 2, "recovery reuses the second already paid answer");
+  const [attempt] = await sql<{ attempts: number; outcome: string; request_tag: string | null }[]>`
+    SELECT attempts, outcome, request_tag FROM translation_attempts WHERE article_id = ${id}`;
+  assert.deepEqual({ ...attempt }, { attempts: 3, outcome: "translated", request_tag: "alignment-retry-1" });
+  assert.equal((await detail(id)).body.complete, true);
 });
